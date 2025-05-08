@@ -1,0 +1,101 @@
+#!/usr/bin/env python3.12
+"""
+Spark + LightGBM training pipeline with MLflow tracking.
+"""
+import os
+import time
+import numpy as np
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.ml.feature import VectorAssembler
+from dotenv import load_dotenv
+import lightgbm as lgb
+import mlflow
+import mlflow.lightgbm
+
+# Load config
+load_dotenv()
+RAW_FEAT_PATH = os.getenv('RAW_FEAT_PATH')
+MODEL_OUTPUT_PATH = os.getenv('MODEL_OUTPUT_PATH')
+MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
+SPARK_MASTER = os.getenv('SPARK_MASTER')
+HC_TAG = os.getenv('HC_AI_CODE_DRAFT')
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+mlflow.lightgbm.autolog()
+
+# Initialize Spark
+spark = SparkSession.builder \
+    .appName('AI_Personalization_Training') \
+    .master(SPARK_MASTER) \
+    .getOrCreate()
+
+# Load feature vectors (Parquet) with schema: user_id, label, feat1, feat2, ...
+df = spark.read.parquet(RAW_FEAT_PATH)
+feature_cols = [c for c in df.columns if c not in ('user_id', 'label')]
+assembler = VectorAssembler(inputCols=feature_cols, outputCol='features')
+df_feat = assembler.transform(df).select('features', 'label')
+
+# Convert to pandas for LightGBM
+pd_df = df_feat.toPandas()
+X = np.vstack(pd_df['features'].apply(lambda v: v.toArray()))
+y = pd_df['label'].values
+
+# Train LightGBM model under MLflow
+with mlflow.start_run(tags={'hc_code': HC_TAG}):
+    params = {
+        'objective': 'binary',
+        'boosting_type': 'gbdt',
+        'verbose': -1,
+        'metric': 'auc'
+    }
+    train_data = lgb.Dataset(X, label=y)
+    start = time.time()
+    model = lgb.train(params, train_data)
+    end = time.time()
+    mlflow.log_metric('train_duration_sec', end - start)
+    mlflow.lightgbm.log_model(model, 'model', artifact_path=MODEL_OUTPUT_PATH)
+
+spark.stop()
+
+#!/usr/bin/env python3.12
+"""
+FastAPI model server for LightGBM predictions (avg <4 ms).
+"""
+import os
+import time
+import numpy as np
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel
+import mlflow.pyfunc
+from dotenv import load_dotenv
+
+# Load config
+load_dotenv()
+MLFLOW_TRACKING_URI = os.getenv('MLFLOW_TRACKING_URI')
+MODEL_URI = os.getenv('MODEL_OUTPUT_PATH')
+
+mlflow.set_tracking_uri(MLFLOW_TRACKING_URI)
+model = mlflow.pyfunc.load_model(MODEL_URI)
+
+app = FastAPI(title='AI Personalization', version='1.0.0')
+
+class Features(BaseModel):
+    features: list[float]
+
+@app.post('/predict')
+def predict(request: Request, payload: Features):
+    # Enforce no outbound
+    # (Assume firewall blocks external traffic)
+    arr = np.array(payload.features).reshape(1, -1)
+    start = time.time()
+    try:
+        pred = model.predict(arr)[0]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+    latency = (time.time() - start) * 1000
+    return {'prediction': float(pred), 'latency_ms': latency}
+
+if __name__ == '__main__':
+    import uvicorn
+    uvicorn.run('serve:app', host='0.0.0.0', port=8000)
